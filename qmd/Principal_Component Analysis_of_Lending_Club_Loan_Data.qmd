@@ -1,0 +1,383 @@
+---
+title: "Principal Component Analysis of Lending Club Loan Data"
+author: "John Liu and Benson Wang"
+class: "SDS363 Multivariate Analysis"
+format: html
+editor: visual
+---
+
+# Lending Club Loan Data
+
+The Lending Club loan dataset provides detailed information on consumer loans issued through the Lending Club platform, including borrower attributes, loan characteristics, payment history, and credit risk indicators, making it a valuable resource for analyzing lending trends, default risk, and financial behaviors.
+
+```{r, message = FALSE,results='hide'}
+library(tidyverse)
+library(corrplot)
+library(PerformanceAnalytics)
+library(heplots)
+library(FactoMineR)
+library(dplyr)
+```
+
+
+# Preparing data
+Data was obtained from [Kaggle](https://www.kaggle.com/datasets/wordsforthewise/lending-club/data).
+```{r, results='hide'}
+accepted <- read.csv("../../accepted_2007_to_2018Q4.csv")
+```
+
+## Subset selection
+To analyze the Lending Club loan data, we select a subset to reduce the number of observations (from 2.2M) to have better interpretability. We first subset the data to include only fully paid loans in Connecticut (CT) for credit card purposes with verified income and individual application type.
+```{r}
+credit <- subset(accepted, 
+    loan_status == "Fully Paid" & 
+    addr_state == "CT" & 
+    purpose == "credit_card" &
+    verification_status == "Verified" &
+    application_type == "Individual"
+)
+```
+
+## Converting loan grade and sub-grade to numeric
+```{r}
+# Define numeric mapping for sub_grade
+sub_grade_levels <- c("A1", "A2", "A3", "A4", "A5",
+                      "B1", "B2", "B3", "B4", "B5",
+                      "C1", "C2", "C3", "C4", "C5",
+                      "D1", "D2", "D3", "D4", "D5",
+                      "E1", "E2", "E3", "E4", "E5",
+                      "F1", "F2", "F3", "F4", "F5",
+                      "G1", "G2", "G3", "G4", "G5")
+
+# Assign numeric values (1 to 35) to sub_grade
+credit$sub_grade_num <- as.numeric(factor(credit$sub_grade, 
+                                            levels = sub_grade_levels))
+
+grade_levels <- c("A", "B", "C", "D", "E", "F", "G")
+credit$grade_num <- as.numeric(factor(credit$grade, 
+                                            levels = grade_levels))
+```
+
+## Variable Selection
+We select a subset of variables that are eligible for Principal Component Analysis (PCA) that are continuous, have less than half of the observations missing, and have meaningful values. Finally, we choose a subset of interesting variables for further analysis.
+
+```{r}
+credit <- credit %>%
+  # Keep continuous variables
+  select_if(is.numeric) %>%
+
+  # Remove variables with too many NAs (more than half of observations)
+  select_if(function(x) sum(is.na(x)) <= nrow(credit)/2) %>%
+
+  # Remove variables where min and max are the same
+  select_if(~ min(.x, na.rm = TRUE) != max(.x, na.rm = TRUE)) %>%
+
+  # Remove variables where min and median are the same
+  select_if(~ min(.x, na.rm = TRUE) != median(.x, na.rm = TRUE)) %>%
+
+  # Remove specific redundant variables
+  select(-funded_amnt_inv,
+         -total_pymnt_inv,
+         -fico_range_low,
+         -last_fico_range_low) %>%
+
+  # Remove variables with high multicollinearity
+  select(-installment)
+
+# Find and remove duplicated variables
+# duplicated_vars <- which(duplicated(as.matrix(credit), MARGIN = 2))
+# print("Duplicate variables:")
+# print(names(credit)[duplicated_vars])
+# credit <- credit[, -duplicated_vars]
+
+# choose interesting variables
+credit <- credit %>% 
+  select(grade_num, sub_grade_num, loan_amnt, dti, annual_inc, fico_range_high, 
+         total_acc, avg_cur_bal, tot_hi_cred_lim)
+
+# Remove rows with missing values
+credit <- credit[complete.cases(credit), ]
+
+head(credit)
+```
+
+### Variable Definitions
+[Data dictionary](https://resources.lendingclub.com/LCDataDictionary.xlsx) for dataset.
+
+*   `loan_amnt`: The listed amount of the loan applied for by the borrower.
+*   `dti`: A ratio calculated using the borrower’s total monthly debt payments on the total debt obligations, excluding mortgage and the requested LC loan, divided by the borrower’s self-reported monthly income.
+*   `annual_inc`: The self-reported annual income provided by the borrower during registration.
+*   `fico_range_high`: The upper boundary range the borrower’s FICO at loan origination belongs to.
+*   `total_acc`: The total number of credit lines currently in the borrower's credit file.
+*   `avg_cur_bal`: Average current balance of all accounts.
+*   `tot_hi_cred_lim`: Total high credit/credit limit.
+*   `grade_num`: The numeric value (1-7) of the grade assigned by Lending Club.
+*   `sub_grade_num`: The numeric value (1-35) of the sub-grade assigned by Lending Club.
+
+### Data Distribution (Raw Data)
+
+```{r}
+chart.Correlation(credit[, -1])
+```
+
+From the correlation graph, we observe that certain variables, such as `annual_inc`, `avg_cur_bal`, `tot_hi_cred_lim`, and `fico_range_high` deviate from a normal distribution. This indicates that the dataset is not multivariate normal, as multivariate normality requires each individual variable to be normally distributed. Additionally, these variables exhibit non-linearity, which may pose a challenge for PCA, as PCA assumes linear relationships among variables.
+
+Let us see if the data is multi-variate normal by plotting the chi-squared quantile plot. (Even though we know it can't be multivariate normal due to the non-normality of the individual variables, we can use this to compare how our transformed data looks.)
+
+
+```{r}
+cqplot(credit[, -1], main = "Chi-Squared Quantile Raw LC Credit Data")
+```
+This is not multivariate normal as points right winged points are distant from the confidence band. We will transform the variables to obtain linearity across all variables. Let's see if we could obtain a multivariate normal distribution.
+
+We will log-transform `annual_inc`, `avg_cur_bal`, `tot_hi_cred_lim`, and `fico_range_high`.
+
+### Data Distribution (Transformed Data)
+
+```{r}
+credit_trans <- credit %>% 
+  mutate(log_annual_inc = log(annual_inc),
+         log_avg_cur_bal = log(avg_cur_bal+10),
+         log_tot_hi_cred_lim = log(tot_hi_cred_lim),
+         log_fico_range_high = log(fico_range_high)
+         ) %>% 
+  select(-annual_inc, -avg_cur_bal, -tot_hi_cred_lim, -fico_range_high)
+```
+
+```{r}
+corrplot.mixed(cor(credit_trans[, -1]), lower.col = "black", upper = "ellipse", 
+               tl.col = "black", number.cex=.7, order = "hclust", 
+               tl.pos = "lt", tl.cex=.7)
+
+chart.Correlation(credit_trans[, -1], histogram = TRUE, pch = 19)
+
+cqplot(credit_trans[, -1], main = "Chi-Squared Quantile Transformed LC Credit Data")
+
+```
+
+The correlation between the transformed variables look similar to the raw data. The variables look relatively normally distributed and linear. The chi-squared quantile plot shows that the transformed data is closer to multivariate normality than the raw data, but it still does not look multivariate normal. We will proceed with PCA to further analyze the data.
+
+## Analysis of Correlations and PCA Feasability
+
+#### Raw Data
+```{r}
+round(cor(credit), 2)
+# corrplot(cor(credit), method = "ellipse")
+
+corrplot.mixed(cor(credit), lower.col = "black", upper = "ellipse", 
+               tl.col = "black", number.cex = .7, order = "hclust", 
+               tl.pos = "lt", tl.cex = .7)
+
+dim(credit)
+```
+
+#### Transformed Data
+```{r}
+round(cor(credit_trans[, -1]), 2)
+# corrplot(cor(credit), method = "ellipse")
+
+corrplot.mixed(cor(credit_trans[, -1]), lower.col = "black", upper = "ellipse", 
+               tl.col = "black", number.cex = .7, order = "hclust", 
+               tl.pos = "lt", tl.cex = .7)
+```
+
+
+We observe some strong correlations, but there are some variables that are not highly correlated with others. PCA works well with strongly correlated variables to reduce dimensionality and we believe that it will be able to work well with this data. We will proceed with PCA to further analyze the data. We have a data set of a sample size of 949 observations with 8 variables. PCA needs enough observations relative to the dimensionality. The data will work well as there is $N \approx 120p > 10p$.
+
+From the correlation matrix, we observe several strong correlations, such as `annual_inc` with `tot_hi_cred_lim` (0.60) and `avg_cur_bal` with `tot_hi_cred_lim` (0.78). These strong relationships suggest that PCA can effectively capture variance in the data by reducing redundancy among highly correlated variables.
+
+However, some variables, like `sub_grade_num` and `total_acc`, exhibit weak correlations with most other features, which may limit their contribution to principal components. Since PCA performs best when variables are strongly correlated, the effectiveness of dimensionality reduction in this dataset will largely depend on how much variance is explained by the first few principal components.
+
+The correlation plot of the transformed data looks similar to the raw data, so we will proceed.
+
+Our dataset consists of 949 observations and 8 variables, which meets the general guideline that PCA requires a sufficient sample size relative to the number of variables. A common rule of thumb suggests $N \approx 120p > 10p$.
+
+Given these factors, we believe PCA will be a useful technique for identifying dominant patterns in the data and reducing dimensionality while retaining essential information.
+
+## Principal Component Analysis
+
+#### Helpful Functions (provided by JDRS)
+Imported `parallel`, `parallelplot`, and `ciscoreplot` functions from JDRS's R script.
+
+```{r, echo=FALSE}
+
+#This chunk defines several helpful functions
+
+
+#####
+#THIS PROGRAM CALCULATES VALUES FOR DETERMINING NUMBER OF PRINCIPLE
+#COMPONENTS TO RETAIN.  IT COMPUTES THE FIRST 10 CUT OFF VALUES FOR
+#TWO PARALLAL METHODS (LONGMAN AND ALLEN) AND THE BROKEN STICK METHOD
+#(FRONTIER).  ;
+#
+#  J Reuning-Scherer
+#  Updated 1.20.25 to print out thresholds
+######
+
+#n is the number of observations in the dataset
+#p is the number of variables in the dataset
+
+parallel<-function(n,p){
+  
+  if (n > 1000 || p > 100) {
+    print ("Sorry, this only works for n<1000 and p<100")
+    stop()
+  }
+  
+  coefs <- matrix(
+    c(0.0316, 0.7611, -0.0979, -0.3138, 0.9794, -.2059, .1226, 0, 0.1162, 
+      0.8613, -0.1122, -0.9281, -0.3781, 0.0461, 0.0040, 1.0578, 0.1835, 
+      0.9436, -0.1237, -1.4173, -0.3306, 0.0424, .0003, 1.0805 , 0.2578, 
+      1.0636, -0.1388, -1.9976, -0.2795, 0.0364, -.0003, 1.0714, 0.3171, 
+      1.1370, -0.1494, -2.4200, -0.2670, 0.0360, -.0024, 1.08994, 0.3809, 
+      1.2213, -0.1619, -2.8644, -0.2632, 0.0368, -.0040, 1.1039, 0.4492, 
+      1.3111, -0.1751, -3.3392, -0.2580, 0.0360, -.0039, 1.1173, 0.5309, 
+      1.4265, -0.1925, -3.8950, -0.2544, 0.0373, -.0064, 1.1421, 0.5734, 
+      1.4818, -0.1986, -4.2420, -0.2111, 0.0329, -.0079, 1.1229, 0.6460, 
+      1.5802, -0.2134, -4.7384, -0.1964, 0.0310, -.0083, 1.1320),ncol=8, byrow=TRUE)
+  
+  calclim <- p
+  if (p > 10) calclim <- 10
+  coefsred <- coefs[1:calclim, ]
+  temp <- c(p:1)
+  #stick <- sort(cumsum(1/temp), decreasing=TRUE)[1:calclim]
+  multipliers <- matrix(c(log(n),log(p),log(n)*log(p),1), nrow=1)
+  longman <- exp(multipliers%*%t(coefs[,1:4]))[1:calclim]
+  allen <- rep(NA, calclim)
+  leig0 <- 0
+  newlim <- calclim
+  if (calclim+2 < p) newlim <-newlim+2
+  for (i in 1:(newlim-2)){
+    leig1 <- coefsred[i,5:8]%*%matrix(c(1,log(n-1),log((p-i-1)*(p-i+2)/2), leig0))
+    leig0 <- leig1
+    allen[i] <- exp(leig1)
+  }
+  pcompnum <- c(1:calclim)
+  #data.frame(cbind(pcompnum,stick,longman,allen))
+  data.frame(cbind(pcompnum,longman,allen))  
+}
+
+#########
+#this function makes a nice plot if given the input from a PCA analysis
+#created by prcomp()
+##
+#arguments are
+#    n=number of observations
+
+parallelplot <- function(comp){
+  if (dim(comp$x)[1] > 1000 || length(comp$sdev) > 100) {
+    print ("Sorry, this only works for n < 1000 and p < 100")
+    stop()
+  }
+  #if (round(length(comp$sdev)) < round(sum(comp$sdev^2))) {
+  #    print ("Sorry, this only works for analyses using the correlation matrix")
+  #    stop()
+  # }
+  
+  parallelanal <- parallel(dim(comp$x)[1], length(comp$sdev))
+  print(parallelanal)
+  calclim <- min(10, length(comp$sdev))
+  eigenvalues <- (comp$sdev^2)[1:calclim]
+  limits <- as.matrix(parallelanal[,2:3])
+  limits <- limits[complete.cases(limits)]
+  ymax <- range(c(eigenvalues),limits)
+  plot(parallelanal$pcompnum, eigenvalues, xlab="Principal Component Number",
+       ylim=c(ymax), ylab="Eigenvalues and Thresholds",
+       main="Scree Plot with Parallel Analysis Limits",type="b",pch=15,lwd=2, col="red")
+  #lines(parallelanal$pcompnum,parallelanal[,2], type="b",col="red",pch=16,lwd=2)
+  lines(parallelanal$pcompnum,parallelanal[,2], type="b",col="green",pch=17,lwd=2)
+  lines(parallelanal$pcompnum,parallelanal[,3], type="b",col="blue",pch=18,lwd=2)
+  #legend((calclim/2),ymax[2],legend=c("Eigenvalues","Stick Method","Longman Method","Allen Method"),  pch=c(15:18), col=c("black","red","green","blue"),lwd=2)
+  legend((calclim/2), ymax[2], legend=c("Eigenvalues","Longman Method","Allen Method"),  pch = c(16:18), col= c("red","green","blue"), lwd=2)
+}
+
+
+#make score plot with confidence ellipse.
+#arguments are output from prcomp, vector with components for plotting (usually c(1,2) or c(1,3)
+#and a vector of names for the points
+
+ciscoreplot<-function(x, comps, namevec){
+  y1<-sqrt(5.99*(x$sdev[comps[1]]^2))
+  ymod<-y1-y1%%.05
+  y1vec<-c(-y1,seq(-ymod,ymod,by=0.05),y1)
+  y2vecpos<-sqrt((5.99-(y1vec^2)/x$sdev[comps[1]]^2)*x$sdev[comps[2]]^2)
+  y2vecneg<--sqrt((5.99-(y1vec^2)/x$sdev[comps[1]]^2)*x$sdev[comps[2]]^2)
+  y2vecpos[1]<-0
+  y2vecneg[1]<-0
+  y2vecpos[length(y2vecpos)]<-0
+  y2vecneg[length(y2vecneg)]<-0
+  
+  plot(x$x[,comps[1]],x$x[,comps[2]], 
+       pch = 19, 
+       cex = 1.2,
+       xlim = c(min(y1vec, x$x[, comps[1]]), max(y1vec, x$x[, comps[1]])),
+       ylim = c(min(y2vecneg, x$x[, comps[2]]), max(y2vecpos, x$x[, comps[2]])),
+       main = "PC Score Plot with 95% CI Ellipse", 
+       xlab = paste("Scores for PC", comps[1], sep = " "), 
+       ylab = paste("Scores for PC", comps[2], sep = " "))
+  
+  lines(y1vec,y2vecpos,col="Red",lwd=2)
+  lines(y1vec,y2vecneg,col="Red",lwd=2)
+  outliers<-((x$x[,comps[1]]^2)/(x$sdev[comps[1]]^2)+(x$x[,comps[2]]^2)/(x$sdev[comps[2]]^2))>5.99
+  
+  points(x$x[outliers, comps[1]], x$x[outliers, comps[2]], pch = 19, cex = 1.2, col = "Blue")
+  
+  text(x$x[outliers, comps[1]],x$x[outliers, comps[2]], col = "Blue", lab = namevec[outliers])
+}
+
+
+```
+
+```{r}
+summary.PCA.JDRS <- function(x){
+  sum_JDRS <- summary(x)$importance
+  sum_JDRS[1, ] <- sum_JDRS[1, ]^2
+  attr(sum_JDRS, "dimnames")[[1]][1] <- "Eigenvals (Variance)"
+  sum_JDRS
+}
+
+credit_trans_pca <- prcomp(credit_trans[, -1], scale. = T)
+round(summary.PCA.JDRS(credit_trans_pca), 3)
+```
+
+```{r}
+screeplot(credit_trans_pca, type = "lines", col = "red", lwd = 2, pch = 19, cex = 1.2, 
+          main = "Scree Plot of Transformed Credit Data")
+```
+
+To determine the number of principal components to retain, we considered several criteria, including total variance explained, the eigenvalue > 1 rule, and the scree plot elbow method. When examining total variance explained, we set a threshold of 80%. We found that retaining four components would capture 80% of the variance, ensuring that a significant portion of the dataset’s variability is preserved while reducing dimensionality. The eigenvalue > 1 criterion, which suggests keeping components with eigenvalues greater than 1, indicated that three components should be retained. Similarly, the scree plot elbow method pointed to either one or three components, depending on where the eigenvalues begin to level off. Since our data is not multivariate normal, we opted not to use parallel analysis, as this method relies on assumptions that are not held in our dataset. Based on these considerations, we decided to retain three principal components, as this choice aligns with both the eigenvalue > 1 rule and the scree plot elbow method, providing a balance between variance retention and dimensionality reduction.
+
+## Principal Components
+
+```{r}
+# Obtain loadings
+round(credit_trans_pca$rotation, 3)
+```
+
+### Interpretations of Principal Components
+
+*   `PC1` (Financial Strength & Credit Capacity): The first principal component has high negative loadings on `log_annual_inc`, `log_avg_cur_bal`, and `log_tot_hi_cred_lim`, indicating that it primarily captures a borrower's overall financial strength and credit availability. Borrowers with higher values in this component tend to have higher income, larger financial reserves, and greater total credit limits, reflecting stronger financial stability and borrowing capacity.
+
+*   `PC2` (Credit Risk & Debt Burden): The second principal component has high positive loadings on `sub_grade_num`, `dti`, and `total_acc`, along with a high negative loading on `log_fico_range_high.` This component represents credit risk and debt burden, where higher values indicate lower FICO scores, riskier loan sub-grades, higher debt-to-income (DTI) ratios, and a greater number of total credit accounts. Borrowers scoring high on this component are likely considered higher risk by lenders.
+
+*   `PC3` (High Debt, Strong Credit Score): The third principal component has high positive loadings on `dti` and `log_fico_range_high`, suggesting that it captures borrowers who carry high debt loads but still maintain strong credit scores. This could reflect high-income borrowers who strategically leverage credit or individuals with a well-managed but substantial amount of debt.
+
+
+```{r}
+ciscoreplot(credit_trans_pca, c(1,2), NULL)
+text(credit_trans_pca$x[, 1], credit_trans_pca$x[, 2], labels = credit_trans$grade_num, cex = 0.6, col = as.numeric(credit_trans$grade_num))
+
+biplot(credit_trans_pca, choices = c(1, 2), pc.biplot = T)
+```
+
+The score plot visualizes the distribution of observations along the first two principal components (`PC1` and `PC2`), with loan grades labeled (A:1, B:2, …, G:7). While the plot provides an overview of how observations are spread, no distinct clusters or groupings are apparent.
+
+A 95% confidence interval (CI) ellipse was added to two of the retained components to assess potential outliers. The dataset contains a significant number of outliers (~40), but given that we have close to 1,000 observations, this is not alarming. However, as PCA assumes multivariate normality, which our dataset does not strictly follow, the 95% CI ellipse may not be a reliable method for detecting outliers.
+
+The biplot further enhances interpretability by displaying the loadings of the original variables on `PC1` and `PC2`, offering insights into their contributions. We observe that `log_annual_inc`, `log_avg_cur_bal`, `log_tot_hi_cred_lim`, and `loan_amnt` are strongly aligned with `PC1`, indicating that this component primarily reflects financial strength and credit availability. Meanwhile, `sub_grade_num` and `dti` are more closely associated with `PC2`, reinforcing its interpretation as a credit risk and debt burden component. Additionally, `log_fico_range_high` and `total_acc` contribute to both `PC1` and `PC2`, suggesting that they play a role in both financial stability and borrowing behavior.
+
+While the score plot does not reveal clear groupings, it provides insight into the data’s spread and the presence of outliers. The 95% CI ellipse is not a reliable outlier detection method due to the dataset’s non-normality. The biplot confirms variable associations, helping to better understand the relationship between borrower attributes and the principal components.
+
+
+## Summary of Findings and PCA Effectiveness
+PCA effectively reduced the eight variables into three principal components, capturing 72% of the total variance and providing meaningful insights into borrower financial profiles. The transformed data exhibited linear relationships, making PCA a suitable method for dimensionality reduction. The principal components reflected financial strength (`PC1`), credit risk (`PC2`), and high debt with strong credit scores (`PC3`). While the score plot did not reveal clear groupings, it provided insight into the spread of observations, and the bi-plot helped visualize the interactions between the principal components. Overall, PCA successfully summarized key financial patterns, demonstrating its effectiveness in understanding the relationships between borrower attributes.

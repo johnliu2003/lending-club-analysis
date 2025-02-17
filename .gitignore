@@ -47,3 +47,20 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Ignore data files
+data/*.csv
+data/*.xlsx
+
+# Ignore R and Python compiled files
+*.rds
+*.pyc
+__pycache__/
+
+# Ignore Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Ignore Quarto and R Markdown temporary files
+*.html
+*.log
+*.aux
